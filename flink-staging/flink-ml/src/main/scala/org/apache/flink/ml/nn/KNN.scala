@@ -24,9 +24,14 @@ import org.apache.flink.api.scala.DataSetUtils._
 import org.apache.flink.api.scala._
 import org.apache.flink.ml.common._
 import org.apache.flink.ml.math.Vector
-import org.apache.flink.ml.metrics.distances.{DistanceMetric, EuclideanDistanceMetric}
+import org.apache.flink.ml.metrics.distances.{SquaredEuclideanDistanceMetric, DistanceMetric, EuclideanDistanceMetric}
 import org.apache.flink.ml.pipeline.{FitOperation, PredictDataSetOperation, Predictor}
 import org.apache.flink.util.Collector
+
+import org.apache.flink.ml.nn.util.QuadTree
+import scala.collection.mutable.ListBuffer
+import org.apache.flink.ml.math.DenseVector
+
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -67,6 +72,7 @@ import scala.reflect.ClassTag
   * (Default value: '''EuclideanDistanceMetric()''')
   *
   */
+
 class KNN extends Predictor[KNN] {
 
   import KNN._
@@ -121,6 +127,7 @@ object KNN {
   /** [[FitOperation]] which trains a KNN based on the given training data set.
     * @tparam T Subtype of [[org.apache.flink.ml.math.Vector]]
     */
+
   implicit def fitKNN[T <: Vector : TypeInformation] = new FitOperation[KNN, T] {
     override def fit(
         instance: KNN,
@@ -143,6 +150,7 @@ object KNN {
     * @tparam T Subtype of [[Vector]]
     * @return The given testing data set with k-nearest neighbors
     */
+
   implicit def predictValues[T <: Vector : ClassTag : TypeInformation] = {
     new PredictDataSetOperation[KNN, T, (Vector, Array[Vector])] {
       override def predictDataSet(
@@ -171,18 +179,77 @@ object KNN {
                   val queue = mutable.PriorityQueue[(Vector, Vector, Long, Double)]()(
                     Ordering.by(_._4))
 
-                  for (a <- testing.values; b <- training.values) {
-                    // (training vector, input vector, input key, distance)
-                    queue.enqueue((b, a._2, a._1, metric.distance(b, a._2)))
+                  var MinVec = new ListBuffer[Double]
+                  var MaxVec = new ListBuffer[Double]
+                  var trainingFiltered = new ListBuffer[DenseVector]
 
-                    if (queue.size > k) {
-                      queue.dequeue()
+                  val b1 = BigDecimal(math.pow(4, training.values.head.size)) * BigDecimal(testing.values.length) * BigDecimal(math.log(training.values.length))
+                  val b2 = BigDecimal(testing.values.length) * BigDecimal(training.values.length)
+
+
+                  // use a quadtree if (4^dim)Ntest*log(Ntrain) < Ntest*Ntrain, and distance is Euclidean
+                  val BruteOrQuad = b1 < b2 &&
+                    ( metric.isInstanceOf[EuclideanDistanceMetric] || metric.isInstanceOf[SquaredEuclideanDistanceMetric])
+
+                  if (!BruteOrQuad) {
+                    for (v <- training.values) {
+                      trainingFiltered = trainingFiltered :+ v.asInstanceOf[DenseVector]
                     }
                   }
 
-                  for (v <- queue) {
-                    out.collect(v)
+                  // define a bounding box for the quadtree
+                    for (i <- 0 to training.values.head.size - 1) {
+                      val minTrain = training.values.map(x => x(i)).min - 0.01
+                      val minTest = testing.values.map(x => x._2(i)).min - 0.01
+
+                      val maxTrain = training.values.map(x => x(i)).max + 0.01
+                      val maxTest = testing.values.map(x => x._2(i)).max + 0.01
+
+                      MinVec = MinVec :+ Array(minTrain, minTest).min
+                      MaxVec = MaxVec :+ Array(maxTrain, maxTest).max
+
+                    }
+
+                  var trainingQuadTree = new QuadTree(MinVec, MaxVec,metric)
+
+                  if (trainingQuadTree.maxPerBox < k) {
+                      trainingQuadTree.maxPerBox = k
+                    }
+
+                    if (BruteOrQuad){
+                      for (v <- training.values) {
+                        trainingQuadTree.insert(v.asInstanceOf[DenseVector])
+                      }
                   }
+
+                    for (a <- testing.values) {
+
+                      if (BruteOrQuad) {
+                        /////  Find siblings' objects and do local kNN there
+                        val siblingObjects = trainingQuadTree.searchNeighborsSiblingQueue(a._2.asInstanceOf[DenseVector])
+
+                        // do KNN query on siblingObjects and get max distance of kNN
+                        // then rad is good choice for a neighborhood to do a refined local kNN search
+                        val knnSiblings = siblingObjects.map(
+                          v => metric.distance(a._2, v)
+                        ).sortWith(_ < _).take(k)
+
+                        val rad = knnSiblings.last
+                        trainingFiltered = trainingQuadTree.searchNeighbors(a._2.asInstanceOf[DenseVector], rad)
+
+                      }
+
+                      for (b <- trainingFiltered) {
+                        // (training vector, input vector, input key, distance)
+                        queue.enqueue((b, a._2, a._1, metric.distance(b, a._2)))
+                        if (queue.size > k) {
+                          queue.dequeue()
+                        }
+                      }
+                      for (v <- queue) {
+                        out.collect(v)
+                      }
+                    }
                 }
               }
             }
@@ -207,6 +274,7 @@ object KNN {
             result
           case None => throw new RuntimeException("The KNN model has not been trained." +
               "Call first fit before calling the predict operation.")
+
         }
       }
     }
